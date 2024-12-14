@@ -3,6 +3,24 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from datautils import MyTrainDataset
 
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+import os
+
+
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    torch.cuda.set_device(rank)
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
 
 class Trainer:
     def __init__(
@@ -18,6 +36,7 @@ class Trainer:
         self.train_data = train_data
         self.optimizer = optimizer
         self.save_every = save_every
+        self.model = DDP(model, device_ids=[gpu_id])
 
     def _run_batch(self, source, targets):
         self.optimizer.zero_grad()
@@ -31,13 +50,14 @@ class Trainer:
         print(
             f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}"
         )
+        self.train_data.sampler.set_epoch(epoch)
         for source, targets in self.train_data:
             source = source.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
             self._run_batch(source, targets)
 
     def _save_checkpoint(self, epoch):
-        ckp = self.model.state_dict()
+        ckp = self.model.module.state_dict()
         PATH = "checkpoint.pt"
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
@@ -45,7 +65,7 @@ class Trainer:
     def train(self, max_epochs: int):
         for epoch in range(max_epochs):
             self._run_epoch(epoch)
-            if epoch % self.save_every == 0:
+            if self.gpu_id == 0 and epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
 
 
@@ -57,14 +77,24 @@ def load_train_objs():
 
 
 def prepare_dataloader(dataset: Dataset, batch_size: int):
-    return DataLoader(dataset, batch_size=batch_size, pin_memory=True, shuffle=True)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        pin_memory=True,
+        shuffle=False,
+        sampler=DistributedSampler(dataset),
+    )
 
 
-def main(device, total_epochs, save_every, batch_size):
+def main(
+    rank: int, world_size: int, save_every: int, total_epochs: int, batch_size: int
+):
+    ddp_setup(rank, world_size)
     dataset, model, optimizer = load_train_objs()
     train_data = prepare_dataloader(dataset, batch_size)
-    trainer = Trainer(model, train_data, optimizer, device, save_every)
+    trainer = Trainer(model, train_data, optimizer, rank, save_every)
     trainer.train(total_epochs)
+    destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -83,5 +113,15 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    device = 0  # shorthand for cuda:0
-    main(device, args.total_epochs, args.save_every, args.batch_size)
+    world_size = torch.cuda.device_count()
+    mp.spawn(
+        main,
+        args=(world_size, args.save_every, args.total_epochs, args.batch_size),
+        nprocs=world_size,
+    )
+
+
+# 总结
+# ddp_setup(rank, world_size)  # 第几个进程，总共几个进程
+# 模型放到gpu_id
+# dataloader使用DistributedSampler

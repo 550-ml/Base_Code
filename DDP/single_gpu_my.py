@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from DDP.single_gpu import load_train_objs
 from datautils import MyTrainDataset
-
 
 class Trainer:
     def __init__(
@@ -11,58 +11,52 @@ class Trainer:
         train_data: DataLoader,
         optimizer: torch.optim.Optimizer,
         gpu_id: int,
-        save_every: int,
-    ) -> None:
-        self.gpu_id = gpu_id
+        save_every: int
+    ):
         self.model = model.to(gpu_id)
         self.train_data = train_data
         self.optimizer = optimizer
+        self.gpu_id = gpu_id
         self.save_every = save_every
+        pass
 
     def _run_batch(self, source, targets):
+        "前向，损失，反传"
         self.optimizer.zero_grad()
         output = self.model(source)
         loss = F.cross_entropy(output, targets)
         loss.backward()
         self.optimizer.step()
-
+        
     def _run_epoch(self, epoch):
-        b_sz = len(next(iter(self.train_data))[0])
-        print(
-            f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}"
-        )
+        "加载数据，循环，batch"
         for source, targets in self.train_data:
             source = source.to(self.gpu_id)
             targets = targets.to(self.gpu_id)
             self._run_batch(source, targets)
-
+            
     def _save_checkpoint(self, epoch):
+        "加载权重保存"
         ckp = self.model.state_dict()
-        PATH = "checkpoint.pt"
+        PATH= f'checkpoint_{epoch}.pt'
         torch.save(ckp, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
-
+        
     def train(self, max_epochs: int):
         for epoch in range(max_epochs):
             self._run_epoch(epoch)
             if epoch % self.save_every == 0:
                 self._save_checkpoint(epoch)
 
-
 def load_train_objs():
-    train_set = MyTrainDataset(2048)  # load your dataset
-    model = torch.nn.Linear(20, 1)  # load your model
+    dataset = MyTrainDataset(2048)
+    model = torch.nn.Linear(20, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-    return train_set, model, optimizer
-
-
-def prepare_dataloader(dataset: Dataset, batch_size: int):
-    return DataLoader(dataset, batch_size=batch_size, pin_memory=True, shuffle=True)
-
 
 def main(device, total_epochs, save_every, batch_size):
+    # 组件准备
     dataset, model, optimizer = load_train_objs()
-    train_data = prepare_dataloader(dataset, batch_size)
+    train_data = DataLoader(dataset, batch_size=batch_size, pin_memory=True, shuffle=True)
     trainer = Trainer(model, train_data, optimizer, device, save_every)
     trainer.train(total_epochs)
 
